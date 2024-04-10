@@ -13,3 +13,5 @@ The computation of the index has been entirely built using R version 4.3.0 (2023
 - **Figures_tables.R** generates all figures and tables shown in the manuscript. 
 - **Pre_raster_generation.R** imports, processes, and saves the raw precipitation data into multi-layer rasters for the Winter, Spring, Summer and Autumn season: *precip_win.tif*, *precip_spr.tif*, *precip_sum.tif*, *precip_aut.tif*.
 - **Temp_raster_generation.R** imports, processes, and saves the raw temperature data into multi-layer rasters for the Winter, Spring, Summer, and Autumn season: *temp_win.tif*, *temp_spr.tif*, *temp_sum.tif*, *temp_aut.tif*.
+
+One way to load the *suit.tif* rasterstack from `figshare` is by simplying importing it with the `raster` package in R with `index <- raster::stack("suit.tif")`.
