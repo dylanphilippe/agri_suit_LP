@@ -1,0 +1,1330 @@
+---
+title: "Agricultural_Suitability"
+author: "Dylan Philippe"
+date: "25/02/2023"
+output: html_document
+---
+
+
+
+Clear workplace and memory
+```{r}
+rm(list = ls())
+gc()
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/DylanPhilippe/OneDrive - Wyss Academy for Nature/Documents/GitHub/Agricultural_Suitability") # Set the knit root.dir here
+```
+
+
+
+```{r, echo=F}
+# We import the necessary packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(raster, tmap, dplyr, sf, R.utils, ggplot2, rgeos, 
+               nngeo, exactextractr, gifski, rlist, ncdf4, tidyr, zoo, 
+               fasterize, minpack.lm)
+
+options(scipen = 999) # This option allows to remove the scientific notation
+
+# Deactivate the spherical geometry S2
+sf::sf_use_s2(FALSE)
+
+CRSproject <- "EPSG:4326"
+EXTproject <- c(-25, 40, 35, 70) # See bellow explanation of the choice of the extent c(xmin, xmax, ymin, ymax)
+```
+
+# Part 1: Gathering different Climate surface and Soil data 
+Although the CRS is the same for all the rasters (ESPG:4326 / WGS84), the data gathered so far has different extent. The CRU dataset over the entire world, i.e. c(-180, 180,-90, 90). The Temperature dataset cover Europe with the following extent: c(-25, 40, 35, 70). Precipitation also covers Europe but with a different extent: c(-29.75, 39.75, 30.25, 70.25).
+Hence, we need to crop the different rasters to the smaller extent (or creation of another extent based on the smallest values for lon and lat degrees).
+In this case, the biggest extent that can cover the different datasets is easternmost (xmin): -29.75 vs -25 -> -25. Westernmost (xmax): 40 vs 39.75 -> 40 (as 39.75 would not be optimal and produce split grids, we can extend 0.25 degree on the 0.5 x 0.5 degree grids). Southernmost (ymin): 35 vs 30.25 -> 35. Northernmost (ymax): 70 vs 70.25 -> 70.
+
+It is very important to find the correct extent for the raster extraction. We can indeed extract the mean values of data with different extent into one raster with common extent and resolution, but we cannot just change and crop the rasters with similar resolution, simply because it might result in cell distortion (although the rasters have the same resolutions, the cells might be shifted). In order to have a grid that respect the dimension of a raster (only full grids), we need to scale down the extent of the study
+
+Let's first import the different "time invariant" inputs for the computation of the evapotranspiration (data from the CRU (Climate Research Unit)).
+I used the CRU CL v.2.0; a gridded climatology of 1961-1990 monthly means (released in 2002) at 10' resolution.
+
+The dataset gives the relative humidity (in %), the wind speed at 10 meters (in meters per seconds) that will be then converted to have values for 2 meters, an elevation raster (in km) and a raster giving the percent of maximum sunshine during daylength. It worth noticing that a raster giving the maximum daily hours of sunshine would have been more appropriate in our case. However, such data are not easily available so we have to convert our percent in hours. The maximum potential sunshine hours is recorded to be around 10 hours per day. Hence, I used this simple conversion so that regions where we have 100% of potential sunshine hours are attributed the approximate maximum value of 11H per day.
+
+$$\mathrm{SUN_{hours}} = \frac{\mathrm{SUN_{percent}}}{100} \times 11$$
+## Creation of the grid
+We will create a grid covering the extent of the analysis. Using a grid rather than keeping the raster will allow us to avoid the raster distortion has we are currently using raster with different resolution and extent.
+```{r}
+# We first load the world shapefile from Natural Earth
+# https://www.naturalearthdata.com/downloads/50m-physical-vectors/
+world <- st_read("./inputs/Admin_units/ne_50m_land.shp")
+world <- st_transform(world, CRSproject)
+
+world
+
+# We now create a bounding box around our area of interest (europe) and that correspond to the max extent of the different rasters (explained in the intro)
+my_box <- rgeos::bbox2SP(n = 70, s = 35, w = -25, e = 40,
+                         proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +type=crs"))
+
+my_box_sf <- st_as_sf(st_make_grid(my_box, n = c(1,1)))
+
+# We intersect the two shapefile to get only the part of europe we are interested in 
+europe <- st_intersection(world, my_box_sf)
+europe
+
+tm_shape(europe) + tm_polygons()
+# Following most of the raster resolution, we can create a grid with 0.5 degree resolution.
+my_rast <- raster(extent(EXTproject), res = 0.5, crs = CRSproject)
+grid_europe <- rasterToPolygons(my_rast)
+grid_europe <- st_as_sf(grid_europe)
+
+# We create the grid identifier
+grid_europe$gid <- seq(1, nrow(grid_europe), by = 1)
+my_rast
+# Remove the "layer" variable
+grid_europe <- grid_europe %>% dplyr::select(-layer)
+
+# We dave the grid of europe and border for later use
+# save(grid_europe, file = "./processed_data/grid_europe.Rdata", overwrite = T)
+# save(europe, file = "./processed_data/europe.Rdata", overwrite = T)
+
+# We remove temporary files 
+rm(my_box, my_rast, my_box_sf, world, grid)
+
+tmap_leaflet(tm_shape(grid_europe) + tm_polygons(alpha = 0)) # We have now our grid of Europe
+```
+
+
+## CRU dataset
+We import and process the climate surface data from the Climate Research Unit (CRU)
+link to the different dataset: https://crudata.uea.ac.uk/cru/data/hrg/
+```{r CRU manipulation}
+# The function that process the data from the CRU CL v.2.0 has been outsourced in the file (CRU CL v.2.0/CRU_manipulation).
+# the function need 4 inputs downloaded directly from  the CRU: sunshine, humidity, windspeed and elevation.
+# In addition to those 4 climate surfaces, I build a raster indicating the latitude. This raster will be necessary for further computations.
+# The output of the function is a list of 5 element: 1/ average sunshine hours 2/ average humidity (%) 3/ average wind speed (m/s) 4/ median elevation 5/ latitude raster (degree)
+
+source("code/[fun]CRU_manipulation.R")
+List_CRU <- CRU_manipulation("inputs/CRU_CL_v.2.0/grid_10min_sunp.dat.gz", "inputs/CRU_CL_v.2.0/grid_10min_reh.dat.gz", "inputs/CRU_CL_v.2.0/grid_10min_wnd.dat.gz", 
+                             "inputs/CRU_CL_v.2.0/grid_10min_elv.dat.gz")
+
+
+# The raster in the list are covering the world, but we are only interested in a part of europe, we then have to change the extent of the rasters
+for (i in 1:5){
+  List_CRU[[i]] <- crop(List_CRU[[i]], EXTproject)
+}
+
+# We can rename the element in the list
+names(List_CRU) <- c("sun", "hum", "win", "lat", "elev")
+```
+
+
+Extraction at grid level
+```{r}
+# We duplicate the grid so that we always keep the grid_europe as a raw file for further extraction 
+grid_CRU <- grid_europe
+
+# We extract mean value fo climate surface to the grid
+grid_CRU$sun <- exact_extract(List_CRU[["sun"]], grid_CRU, fun = "mean")
+grid_CRU$hum <- exact_extract(List_CRU[["hum"]], grid_CRU, fun = "mean")
+grid_CRU$win <- exact_extract(List_CRU[["win"]], grid_CRU, fun = "mean")
+grid_CRU$lat <- exact_extract(List_CRU[["lat"]], grid_CRU, fun = "mean")
+grid_CRU$elev <- exact_extract(List_CRU[["elev"]], grid_CRU, fun = "mean")
+
+tm_shape(grid_CRU) + tm_polygons("sun") + tm_shape(europe) + tm_borders()
+
+# Save grid
+# save(grid_CRU, file = "./processed_data/grid_CRU.Rdata", overwrite = F)
+```
+
+## Temperatures 
+We will now import the temperature and precipitations dataset by Luterbacher and Pauling 
+```{r Temperature manipulation}
+# Let's first import the historical temperature dataset from Luterbacher. Here are some info on the README textfile:
+# Grid: 0.5° x 0.5°  
+# Spatial area: 25W - 40E und 35 - 70N
+# Note: the date are valied for a 0.5x0.5deg box. The center of the box is always on a xx.25 coordinate	
+# Time period: Winter 1500 - Autumn 2002 
+# YearSeason followed by 9100 Gridpoints
+# Seasons are given as  13(Winter, DJF), 14(Spring, MAM), 15 (Summer, JJA), 16 (Autumn, SON)
+
+# The goal of the function is to create 3 different stacks of rasters indicating the minimum, maximum and mean temperature for each year in the dataset.
+source("code/[fun]temp_data_manipulation.R")
+
+temp_mean_min_max_1500_2002 <- temp_data_manipulation("inputs/Temperature/TT_Europe_1500_2002.txt")
+
+# Since we are not interested in years after 2000, we will only keep 501 layers; 1500 to 2000 ( without 2001 and 2002)
+for (i in 1:3){
+temp_mean_min_max_1500_2002[[i]] <- dropLayer(temp_mean_min_max_1500_2002[[i]], c(502, 503))
+}
+
+# We rename the dataset and drop the old one 
+temp_mean_min_max_1500_2000 <- temp_mean_min_max_1500_2002
+remove(temp_mean_min_max_1500_2002)
+```
+
+
+Extraction at grid level
+```{r}
+grid_mean_temp <- rep(list(grid_europe), 501)
+grid_min_temp <- rep(list(grid_europe), 501)
+grid_max_temp <- rep(list(grid_europe), 501)
+
+# Create a sequence of years to paste the temperature and precipitations
+years <- seq(1500, 2000, by = 1) %>% as.character()
+
+# We start with mean temperature 
+for (i in 1:501){
+  print(i)
+  grid_mean_temp[[i]]$tmp <- exact_extract(temp_mean_min_max_1500_2000[[1]][[i]], grid_europe, fun = "mean")
+  colnames(grid_mean_temp[[i]])[colnames(grid_mean_temp[[i]]) == 'tmp'] <- paste("tmp_", years[i], sep = "")
+}
+
+# Save grid
+# save(grid_mean_temp, file = "./processed_data/grid_mean_temp.Rdata", overwrite = F)
+
+# We start with mean temperature 
+for (i in 1:501){
+   print(i)
+  grid_min_temp[[i]]$tmn <- exact_extract(temp_mean_min_max_1500_2000[[2]][[i]], grid_europe, fun = "mean")
+  colnames(grid_min_temp[[i]])[colnames(grid_min_temp[[i]]) == 'tmn'] <- paste("tmn_", years[i], sep = "")
+}
+
+# Save grid
+# save(grid_min_temp, file = "./processed_data/grid_min_temp.Rdata", overwrite = F)
+
+# Max temperatures 
+for (i in 1:501){
+   print(i)
+  grid_max_temp[[i]]$tmx <- exact_extract(temp_mean_min_max_1500_2000[[3]][[i]], grid_europe, fun = "mean")
+  colnames(grid_max_temp[[i]])[colnames(grid_max_temp[[i]]) == 'tmx'] <- paste("tmx_", years[i], sep = "")
+}
+
+# Save grid
+# save(grid_max_temp, file = "./processed_data/grid_max_temp.Rdata", overwrite = F)
+```
+
+
+## Precipitation 
+```{r Precipitation manipulation}
+# We turn now to the precipitation dataset by Pauling et al.
+# Gridded (0.5° resolution, lon x lat = 140 x 82) 
+# precipitation reconstructions over all European land areas for winter (prec_pauling_wi.txt), spring (prec_pauling_sp.txt), summer (prec_pauling_su.txt) and autumn (prec_pauling_au.txt).
+# All these files cover the area 30.25N-70.75N / 29.75W-39.75E (all coordinates given here denote the centre of each box).
+# Non-land grid boxes are indicated by values set to -99.999.
+# Data run from 1500 to 2000. Data from 1901-2000 are observational estimates from the Mitchell et al. (2004) dataset. 
+# Data prior to 1901 are reconstructed values (see data set reference for details: Pauling et al. (2005)). 
+
+# https://crudata.uea.ac.uk/cru/projects/soap/data/recon/#paul05
+
+source("code/[fun]pre_data_manipulation.R")
+
+# The fucntion takes as input the 4 files indicating the observations for the 4 seasons as follow; fun(autumn, winter, spring, summer). The output will be 500 stacks of rasters indicating yearly mean precipitations (in mm).
+pre_1500_2000 <- pre_data_manipulation("inputs/Precipitation/prec-pauling-au.txt", "inputs/Precipitation/prec-pauling-wi.txt", "inputs/Precipitation/prec-pauling-sp.txt", 
+                                       "inputs/Precipitation/prec-pauling-su.txt")
+
+```
+
+Extracting at grid level 
+```{r}
+# Creat the list where we will store the data
+grid_pre <- rep(list(grid_europe), 501)
+
+# Creat the year sequence
+years <- as.character(seq(1500, 2000, by = 1))
+
+for (i in 1:501){
+  print(i)
+  grid_pre[[i]]$pre <- exact_extract(pre_1500_2000[[i]], grid_europe, fun = "mean")
+  colnames(grid_pre[[i]])[colnames(grid_pre[[i]]) == 'pre'] <- paste("pre_", years[i], sep = "")
+}
+
+tm_shape(grid_pre[[1]]) + tm_polygons("pre_1500") + tm_shape(europe) + tm_borders()
+
+# save(grid_pre, file = "./processed_data/grid_pre.Rdata", overwrite = T)
+```
+
+
+## Evapotranspiration 
+CHECK DIFFERENCE REF AND POT: https://www.sciencedirect.com/science/article/pii/S0378377419315616
+
+The calculation of reference evapotranspiration ($ET_0$), i.e., the rate of evapotranspiration from a
+hypothetic reference crop with an assumed crop height of 12 cm, a fixed canopy resistance of
+70 ms‐1 and an albedo of 0.23 (closely resembling the evapotranspiration from an extensive surface
+of green grass), is done according to the Penman‐Monteith equation (Monteith, 1965, 1981; FAO,
+1992).
+
+$$ET_0 = ET_{ar}\; + \;ET_{ra}$$
+Where the aerodynamic term can be approximated by: 
+$$ET_{ar} = \frac{\gamma}{\vartheta\; +\;\gamma^{\star}}\cdot\frac{900}{T_a\;+\;273}\cdot U_2\cdot(e_a\;\;e_d)$$
+and the radiation temr by:
+$$ET_{ra}=\frac{\vartheta}{\vartheta\; + \; \gamma^{\star}}\cdot(R_n\; - \;G)\cdot\frac{1}{\lambda}$$
+where variable in the two equation are as follow:
+
+$\gamma$ psychrometric constant (kPa °$C^{-1}$) 
+
+$\gamma^{\star}$    modified psychrometric constant (kPa °$C{-1}$) 
+
+$\vartheta$     slope of vapor pressure curve (kPa °$C^{-1}$) 
+
+$T_a$     average dayly temperature (°C)
+
+$e_a$     saturation vapor pressure (kPa) 
+
+$e_d$     vapor pressure at dew point (kPa) 
+
+$(e_a\;-\;e_d)$     vapor pressure deficit (kPa) 
+
+$R_n$     net radiation flux at surface (MJ $m^{-2}$ $d^{-1}$)
+
+$G$ soil heat flux (MJ $m^{-2}$ $d^{-1}$)*
+
+$\lambda$ latent heat of vaporization (MJ $kg^{-1}$)
+
+
+The calculation procedure of those parameters has been outsourced but need the following inputs: Mean temperature, max temperature, min temperature, wind speed at 2m in m/s, relative humidity, potential sushine hours per day, latitude, elevation and the Julian data.
+```{r, echo=FALSE, warning=FALSE}
+# We load the different climate dataset 
+load(file = "./processed_data/grid_CRU.Rdata")
+load(file = "./processed_data/grid_max_temp.Rdata")
+load(file = "./processed_data/grid_mean_temp.Rdata")
+load(file = "./processed_data/grid_min_temp.Rdata")
+load(file = "./processed_data/grid_pre.Rdata")
+
+source("code/[fun]evapo_grid.R")
+
+# the function needs the following inputs: Reference_Evapo(A, B, C, D, E, F, G , H)
+# A: Temperature raster
+# B: Max temperature raster 
+# C: Min temperature raster
+# D: Wind speed raster
+# E: Relative humidity raster
+# F: Sunshine hours per day raster
+# G: Latitude raster
+# H: Elevation raster
+
+# Time invariant stuff
+WIND <- grid_CRU %>% st_drop_geometry() %>% dplyr::select(win) %>%
+  unlist() %>% as.numeric()
+HUM <- grid_CRU %>% st_drop_geometry() %>% dplyr::select(hum) %>%
+  unlist() %>% as.numeric()
+SUN <- grid_CRU %>% st_drop_geometry() %>% dplyr::select(sun) %>%
+  unlist() %>% as.numeric()
+LATITUDE <- grid_CRU %>% st_drop_geometry() %>% dplyr::select(lat) %>%
+  unlist() %>% as.numeric()
+ELEVATION <- grid_CRU %>% st_drop_geometry() %>% dplyr::select(elev) %>%
+  unlist() %>% as.numeric()
+
+# The grid where we will store the yearly ET0
+ET0_year <- rep(list(0), 501)
+
+for (j in 1:501){
+  # Counter so that we can check the progress
+   print(j)
+TEMPER <- grid_mean_temp[[j]] %>% st_drop_geometry() %>% dplyr::select(-gid) %>%
+  unlist() %>% as.numeric()
+
+TMAX <- grid_max_temp[[j]] %>% st_drop_geometry() %>% dplyr::select(-gid) %>% 
+  unlist() %>% as.numeric()
+
+TMIN <- grid_min_temp[[j]] %>% st_drop_geometry() %>% dplyr::select(-gid) %>% 
+  unlist() %>% as.numeric()
+
+# Parameters
+Tau <- rep(list(0), 365)
+delta <- rep(list(0), 365)
+d <- rep(list(0), 365)
+psi <- rep(list(0), 365)
+Ra <- rep(list(0), 365)
+DL <- rep(list(0), 365)
+Rs <- rep(list(0), 365)
+Rns <- rep(list(0), 365)
+Rnl <- rep(list(0), 365)
+Rn <- rep(list(0), 365)
+ETra <- rep(list(0), 365)
+ET0 <- rep(list(0), 365)
+ET0_grid <- rep(list(grid_europe), 365)
+
+# We use the function 
+ET0_bind <- Reference_Evapo(TEMPER, TMAX, TMIN, WIND, HUM, SUN, LATITUDE, ELEVATION)
+
+# Since everything is binded together, we can just summarize by grouping by grid id
+ET0_year[[j]] <- ET0_bind %>% group_by(gid) %>% summarise(ET0 = mean(ET0, na.rm = T)) 
+ET0_year
+}
+
+Reference_Evapo_grid <- rep(list(grid_europe), 501)
+
+for (i in 1:501){
+  Reference_Evapo_grid[[i]] <- left_join(Reference_Evapo_grid[[i]], ET0_year[[i]], by = "gid")
+}
+
+# Save the dataset 
+# save(Reference_Evapo_grid, file = "./processed_data/grid_evapo.Rdata", overwrite = T)
+```
+
+## Aridity Index
+The next chunk takes care of the Aridity index which is simple the ratio between annual precipitations and reference evapotranspiration.
+
+```{r}
+load(file = "./processed_data/grid_evapo.Rdata")
+load(file = "./processed_data/grid_pre.Rdata")
+
+AI_index <- rep(list(0), 501)
+grid_AI <- rep(list(grid_europe), 501)
+
+for (i in 1:501){
+ AI_index[[i]] <- grid_pre[[i]] %>% st_drop_geometry() %>% dplyr::select(-gid)/Reference_Evapo_grid[[i]]  %>% st_drop_geometry() %>% dplyr::select(-gid) %>% mutate(ET0 = ET0*365)
+
+# We change the names 
+colnames(AI_index[[i]]) <- "AI"
+
+# We bring the grid id
+gid <- grid_europe$gid %>% as.numeric()
+
+AI_index[[i]]$gid <- gid
+
+grid_AI[[i]] <- left_join(grid_AI[[i]], AI_index[[i]], by = "gid")
+}
+
+# save(grid_AI, file = "./processed_data/grid_AI.Rdata", overwrite = T)
+```
+
+
+In order to investigate soil suitability, they decided to use Carbon density (soil nutrients) and the pH content (toxicity). The data come from the HWSD (harmonized world soil database).
+## HWSD
+We process data form the harmonized world soil database
+
+The carbon content from the HWSD
+source: https://daac.ornl.gov/SOILS/guides/HWSD.html
+
+T_C: Topsoil carbon content (T_C and S_C) are based on the carbon content of the dominant soil type in each regridded cell rather than a weighted average.
+
+AWT_T_SOC: Area weighted topsoil carbon content, AWT_T_SOC = (sum(SEQ(SHARE * T_OC)) * 3 * T_BULK_DENSITY).
+kg C m-2
+
+```{r}
+# Top soil carbon content 
+carbon_HWSD <- raster("inputs/HWSD/T_C.nc4")
+
+# We extract the carbon content at grid level 
+grid_HWSD <- grid_europe
+
+grid_HWSD$carbon <- exact_extract(carbon_HWSD, grid_HWSD, fun = "mean")
+
+#We pursue our analysis using now the pH content in top soil
+#Top soil pH content (in H2O) in -log(H+)
+
+# We import the soil pH 
+pH <- raster("inputs/HWSD/T_PH_H2O.nc4")
+
+# We extract it at grid level 
+grid_HWSD$pH <- exact_extract(pH, grid_HWSD, fun = "mean")
+
+# Save the grids
+save(grid_HWSD, file = "./processed_data/grid_HWSD.Rdata", overwrite = T)
+```
+
+
+## GDD
+Here we import the 4 seasons. Keeping the four distinct seasons will allow to gain more precision in the computation of the Growing Degree Days
+```{r}
+  historical_temp <- as.matrix(read.table("inputs/Temperature/TT_Europe_1500_2002.txt", sep = ""))
+  # The table is huge. We can see that the first column give the year and the season.
+  # Hence, the first line given by 150013 is the average temperature for winter 1500.
+  # We can henceforth create a loop over the lines to extract all the year and season and generate rasters out of it.
+  dim(historical_temp)
+  
+  # We have 2012 lines and 9101 columns
+  # We can first drop the first column as we know when it starts and when it ends
+  historical_temp <- historical_temp[, -1]
+  dim(historical_temp)
+  
+  # We have now 9100 column which correspond to the number of gridpoints. Let's create the loop
+  # We now create the loop over each rows and store every matrix in a list
+  mydata <- rep(list(0), 2012)
+  
+  for (i in 1:2012){
+    mydata[[i]] <- matrix(historical_temp[i, ], nrow = 70, ncol = 130, byrow = T)
+  }
+  
+  # We can now split the list and group it in 4 so that we have 503 lists with 4 raster inside: 1 for each season
+  mydata <- split(mydata, rep(1:ceiling(2012/4), each = 4)[1:2012])
+  
+  # The seasons are: [[1]] Winter [[2]] Spring [[3]] Summer [[4]] Autumn for each of the 503 elements in the list
+  # Remov 2001 and 2002 so that we have our 501 obs
+  mydata <- mydata[-c(502, 503)]
+```
+The last piece of the puzzle are the Growing degree days. Following Ramankutty et al., GDD is calculated simply as an annual sum of daily mean temperatures over a base temperature of 5°C. 
+
+$$GDD = \sum^{365}_{i=1}\mathrm{max}(0, \; T_i\;-\;5)\;\mathrm{day\;degrees}$$
+
+```{r, echo=F}
+# For the GDD we will use the seasonal temperatures to gain precision and avoid the strict 0 for north/Est Europe in case the mean temperature is bellow 5°C
+# Hence, we construct 4 measures of GDD, one for each season. This will be then averaged over each year
+# Since each season sums up to 3 months, we have approximately 91 days in total (365/4 = 91.25)
+
+# Little function that computes GDD for each season
+fun_GDD <- function(tmp){
+  tmp[tmp == -999.99] <- NA
+  tmp <- tmp - 5
+  tmp[tmp < 0] <- 0
+  GDD <- tmp*91.25
+}
+
+
+GDDlist <- rep(list(0), 501)
+
+for (i in 1:501){
+  GDDlist[[i]] <- (fun_GDD(mydata[[i]][[1]]) + fun_GDD(mydata[[i]][[2]]) + fun_GDD(mydata[[i]][[3]]) + fun_GDD(mydata[[i]][[4]]))
+  GDDlist[[i]] <- raster(GDDlist[[i]], crs = CRSproject)
+  extent(GDDlist[[i]]) <- EXTproject
+}
+
+# Extract at grid level
+grid_GDD <- rep(list(grid_europe), 501)
+
+for (i in 1:501){
+  print(i)
+  grid_GDD[[i]]$gdd <- exact_extract(GDDlist[[i]], grid_GDD[[i]], fun = "mean")
+}
+
+# save(grid_GDD, file = "./processed_data/grid_GDD.Rdata", overwrite = T)
+```
+
+# Part 2: Model Calibration
+
+## A) Fitting the parameters
+We calibrate our model using the FAO GAEZ suitability maps.
+The first step of getting the fitting parameters is gathering information on the current best suitability dataset: FAO GAEZ
+The FAO GAET suitability index range form 0 - 10000 (all land in gridcell, i.e. not only in current cropland locations).
+Time period is 1971 - 2000.
+Water input is rainfed.
+C02 fertilization is without.
+
+Since the FAO do not give aggregate suitability but that of different type of crop, we can take the average of 4 of the main crops used historically in Europe: Wheat, oat, barley and rye.
+
+```{r}
+grid_FAO <- grid_europe
+# Downloaded from FAO GAEZ data portal
+wheat <- raster("./inputs/FAO/sxLr0_whe.tif")
+oat <- raster("./inputs/FAO/sxLr0_oat.tif")
+rye <- raster("./inputs/FAO/sxLr0_rye.tif")
+barley <- raster("./inputs/FAO/sxLr0_brl.tif")
+
+# We axtract mean value at grid level
+grid_FAO$FAO_wheat <- exact_extract(wheat, grid_FAO, fun = "mean")
+grid_FAO$FAO_oat <- exact_extract(oat, grid_FAO, fun = "mean")
+grid_FAO$FAO_rye <- exact_extract(rye, grid_FAO, fun = "mean")
+grid_FAO$FAO_barley <- exact_extract(barley, grid_FAO, fun = "mean")
+
+# We normalized using a 0 - 10000 threshold and not the maximum and min. Hence if a crop type range from 1000 to 8000 in europe, 1000 and 8000 would take value 0 and 1 respectively and be comparable to another crop with min and max 0-10000.
+# Although all different crops range from 0 to 10000 expect for Rye (max 9999.694)
+
+grid_FAO <- grid_FAO %>% mutate(FAO_wheat = (FAO_wheat - 0)/(10000 - 0), 
+                                FAO_oat = (FAO_oat - 0)/(10000 - 0), 
+                                FAO_rye = (FAO_rye - 0)/(10000 - 0), 
+                                FAO_barley = (FAO_barley - 0)/(10000 - 0))
+
+# We construct average suitability taking the mean of the 4 crops
+grid_FAO <- grid_FAO %>% mutate(FAO_suit = (FAO_wheat + FAO_oat + FAO_rye + FAO_barley)/4)
+
+# Remove temporary files
+rm(barley, oat, rye, wheat)
+
+# Quick epxloration of european agricultural suitability from FAO 4 major european crops
+tm_shape(grid_FAO) + tm_polygons("FAO_suit", palette = "RdYlGn", breaks = seq(0, 1, by = 0.1)) + tm_shape(europe) + tm_borders()
+# save(grid_FAO, file = "./processed_data/grid_FAO.Rdata", overwrite = T)
+```
+
+
+Model calibration for functional forms TO UPDATE AND OUTSOURCE FUNCTIONAL FORMS
+```{r}
+# We load the gridded dataset processed in the main script 
+grid_fitting <- grid_europe
+
+load("./processed_data/grid_GDD.Rdata")
+load("./processed_data/grid_AI.Rdata")
+load("./processed_data/grid_HWSD.Rdata")
+load("./processed_data/grid_FAO.Rdata")
+
+
+# For the time varying parameters, we select the last 30 years since FAO gives suitability using climate data from 1971 - 2000
+# Since first grid is 1500, grid 472 is 1971 and 501 is 2000
+GDD_grid_71_00 <- grid_GDD[c(472:501)]
+AI_index_grid_71_00 <- grid_AI[c(472:501)]
+
+# We repeatedly left join to have the 30 years over each column so then we can do a rowmeans
+# We start with GDD
+grid_gdd_30_avg <- GDD_grid_71_00[[1]] %>% dplyr::select(gid, gdd)
+for (i in 2:30){
+  grid_gdd_30_avg <- left_join(grid_gdd_30_avg, GDD_grid_71_00[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, gdd), by = "gid")
+}
+
+# Remove the geometry and grid id (order is maintained)
+rows_gdd <- grid_gdd_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+# We compute average GDD for each grid over the past 30 years using the rowmean 
+rows_gdd$gdd_30 <- rowMeans(rows_gdd, na.rm = T)
+
+# ai
+grid_ai_30_avg <- AI_index_grid_71_00[[1]] %>% dplyr::select(gid, AI)
+for (i in 2:30){
+  grid_ai_30_avg <- left_join(grid_ai_30_avg, AI_index_grid_71_00[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, AI), by = "gid")
+}
+
+rows_ai <- grid_ai_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+rows_ai$ai_30 <- rowMeans(rows_ai, na.rm = T)
+
+
+# We attach the soil ph and carbon content
+grid_fitting <- left_join(grid_fitting, grid_HWSD %>% st_drop_geometry() %>% dplyr::select(gid, pH, carbon), by = "gid")
+
+# We bring the average back to the grid
+grid_fitting$gdd_30 <- rows_gdd$gdd_30
+grid_fitting$ai_30 <- rows_ai$ai_30
+
+grid_fitting <- left_join(grid_fitting, grid_FAO %>% st_drop_geometry() %>% dplyr::select(gid, FAO_suit), by = "gid")
+
+
+# Remove temporary files
+rm(grid_AI, AI_index_grid_71_00, grid_GDD, GDD_grid_71_00, grid_ai_30_avg, grid_gdd_30_avg, grid_HWSD, rows_ai, rows_gdd)
+
+# We save the grid for technical validation exploration
+# save(grid_fitting, file = "./processed_data/grid_fitting.Rdata", overwrite = T)
+```
+
+
+
+For the fitting, each element is looked separately to investigate its impact on suitability
+Following ramankutty, we need to impose some filtering for other inputs:
+For instance, when looking at GDD, we need to fix the other parameters so that we don't pick areas not suitable in the first place (very bad pH, carbon and moisture).
+
+### GDD
+```{r}
+# For GDD, chosen points have 
+# 4 < Csoil < 10
+# 6 < pH < 8
+# ai > 0.5
+grid_fitting_gdd <- grid_fitting %>% filter(carbon > 4 & carbon < 10 & ai_30 > 0.5 & pH > 6 & pH < 8) %>% dplyr::select(gid, FAO_suit, gdd_30)
+
+# We now construct bins of observations and take the max of each bins (so that we have 100 points on the map, to keep uniformity with other index)
+# Ex: all obs with  0 < GDD < bins_gdd will belong to bin 1, etc...
+
+# We creat the bins
+grid_fitting_gdd <- grid_fitting_gdd %>% mutate(points_bin = cut(gdd_30, breaks= 50))
+
+# For each GDD bins, we take the average GDD value and associate it to the max suitability value (i.e. given this GDD range, what is the maximal yield we can get)
+grid_fitting_gdd <- grid_fitting_gdd %>% group_by(points_bin) %>% mutate(gdd_bin = mean(gdd_30), 
+                                                                         FAO_limit = max(FAO_suit)) %>% ungroup()
+
+
+#important to sort along x values so that the plotting looks like one single line
+# Lets first select and drop the geometry
+dataset <- grid_fitting_gdd %>% st_drop_geometry() %>% dplyr::select(gdd_bin, FAO_limit)
+dataset <- dataset[order(dataset$gdd_bin),] # Ordering
+
+
+# Since we still have repeated bins and FAO_limit (all obs within each bins are an observations), we just take one per bins, hence using the unique function()
+df_unique <- unique(dataset)
+df_unique <- data.frame(x=df_unique$gdd_bin, y=df_unique$FAO_limit)
+
+# Limit of fitting curve when data first reach best suitable conditions 1205.6464
+df_unique <- df_unique %>% filter(x < 1205.6464)
+
+# fitting code using the sigmoidal functional form with initial guess taking the one in Ramankutty
+fitmodel <- nls(y~1/(1 + exp(a * (b-x))), start=list(a=.05,b=1100), data = df_unique)
+
+# We define our sigmoidal function to have an idea of the fitting with the data that have been used
+sigmoid <- function(params_gdd, x) {
+  1 / (1 + exp(params_gdd[1] * ((params_gdd[2]) - x)))
+}
+
+# visualization code
+# get the coefficients using the coef function
+params_gdd <- coef(fitmodel)
+
+
+# We plot the bin data with the sigmoidal curve and fitting parameters found previously
+ggplot(data = dataset, aes(x = gdd_bin, y = FAO_limit)) + geom_point() +
+  labs(y = "Suitability index (FAO)", x = "Growing degree days") +
+  theme_minimal(base_family = "serif", base_size = 15) +
+  stat_function(fun=function(x){(1/(1+exp(params_gdd[1]*(params_gdd[2]-x))))})
+# ggsave(filename = "./figures/fit_GDD.png", bg = "white")
+```
+
+### AI
+We repeat the procedure using the aridity index
+
+```{r}
+# For GDD, chosen points have 
+# 4 < Csoil < 10
+# 6 < pH < 8
+# GDD > 1300
+grid_fitting_ai <- grid_fitting %>% filter(carbon > 4 & carbon < 10 & gdd_30 > 1300 & pH > 6 & pH < 8) %>% dplyr::select(gid, FAO_suit, ai_30)
+
+# We drop it for now 
+grid_fitting_ai <- grid_fitting_ai %>% filter(!is.na(ai_30))
+
+bins_ai <- (max(grid_fitting_ai$ai_30) - min(grid_fitting_ai$ai_30))/50
+
+# We now construct bins of observations and take the max of each bins (1 bin for each observation with a GDD break of 0.05)
+# Ex: all obs with  0 < ai < 0.05 will belong to bin 1, etc...
+#grid_fitting_ai <- grid_fitting_ai %>% mutate(points_bin = cut(ai_30, breaks=seq(round(min(grid_fitting_ai$ai_30), digits = 3), round(max(grid_fitting_ai$ai_30), digits = 3), by = round(bins_ai, digits = 3))))
+
+grid_fitting_ai <- grid_fitting_ai %>% mutate(points_bin = cut(ai_30, breaks = 50))
+
+# For each AI bins, we take the average AI value and associate it to the max suitability value (i.e. given this AI range, what is the maximal yield we can get)
+grid_fitting_ai <- grid_fitting_ai %>% group_by(points_bin) %>% mutate(ai_bin = mean(ai_30), 
+                                                                         FAO_limit = max(FAO_suit)) %>% ungroup()
+
+
+#important to sort along x values so that the plotting looks like one single line
+# Lets first select and drop the geometry
+dataset_ai <- grid_fitting_ai %>% st_drop_geometry() %>% dplyr::select(ai_bin, FAO_limit)
+dataset_ai <- dataset_ai[order(dataset_ai$ai_bin),] # Ordering
+
+# Reach close to 1 at 0.3859917
+
+# Since we still have repeated bins and FAO_limit, we just take one per bins, hence using the unique function()
+df_unique_ai <- unique(dataset_ai)
+df_unique_ai <- data.frame(x=df_unique_ai$ai_bin, y=df_unique_ai$FAO_limit)
+
+# The fact that we have y = 1 after 0.3859917 impose a limit curve and is not relevant for the computation of the parameters (doesn't change anything if we remove the filter)
+df_unique_ai <- df_unique_ai %>% filter(x <= 0.3859917)
+
+# fitting code
+fitmodel_ai <- nls(y~1/(1 + exp(c * (d-x))), start=list(c=14,d=0.3), data = df_unique_ai)
+
+# We define our sigmoid function to have an idea of the fitting with the data that have been used
+sigmoid = function(params_ai, x) {
+  1 / (1 + exp(params_ai[1] * ((params_ai[2]) - x)))
+}
+# visualization code
+# get the coefficients using the coef function
+params_ai=coef(fitmodel_ai)
+
+# We plot the bin data with the sigmoidal curve and fitting parameters found previously
+ggplot(data = dataset_ai, aes(x = ai_bin, y = FAO_limit)) + geom_point() +
+  labs(y = "Suitability index (FAO)", x = "Aridity index") +
+  theme_minimal(base_family = "serif", base_size = 15) +
+  stat_function(fun=function(x){(1/(1+exp(params_ai[1]*(params_ai[2]-x))))})
+# ggsave(filename = "./figures/fit_AI.png", bg = "white")
+```
+
+
+### Carbon 
+```{r}
+load("./processed_data/grid_fitting.Rdata")
+# For carbon, chosen points have 
+# 6 < pH < 8
+# ai > 0.5
+# GDD > 1300
+grid_fitting_carbon <- grid_fitting %>% filter(ai_30 > 0.5 & pH > 6 & pH < 8 & gdd_30 > 1300) %>% dplyr::select(gid, FAO_suit, carbon)
+
+# We now construct bins of observations and take the max of each bins (1 bin for each observation with a carbon break of 0.25)
+# Ex: all obs with  0 < carbon < 0.25 will belong to bin 1, etc...
+
+grid_fitting_carbon <- grid_fitting_carbon %>% mutate(points_bin = cut(carbon, breaks=50))
+
+# For each carbon bins, we take the average carbon value and associate it to the max suitability value (i.e. given this carbon range, what is the maximal yield we can get)
+grid_fitting_carbon <- grid_fitting_carbon %>% group_by(points_bin) %>% mutate(carbon_bin = mean(carbon), 
+                                                                         FAO_limit = max(FAO_suit)) %>% ungroup()
+
+#important to sort along x values so that the plotting looks like one single line
+# Lets first select and drop the geometry
+dataset_carbon <- grid_fitting_carbon %>% st_drop_geometry() %>% dplyr::select(carbon_bin, FAO_limit)
+dataset_carbon <- dataset_carbon[order(dataset_carbon$carbon_bin),] # Ordering
+
+# Since we still have repeated bins and FAO_limit, we just take one per bins, hence using the unique function()
+df_unique_carbon <- unique(dataset_carbon)
+df_unique_carbon <- data.frame(x=df_unique_carbon$carbon_bin, y=df_unique_carbon$FAO_limit)
+
+# FAO suit greater than 95 at C bins  < 3.398128
+# FAO suit start be lower than 95 again at 8.894976
+# Between, we have the maximum potential
+# if we do not replace, the fitting will esrtiamte lower value of carbon given the slight decrease that happen between the threshold...
+# df_unique_carbon <- df_unique_carbon %>% mutate(y = ifelse(x >= 3.398128 & x <= 8.894976, 1, y))
+
+# fitting code
+# Here we use the nlsLM function that finds convergence when nls gives "singular gradient"
+fitmodel_carbon <- nlsLM(y ~ a/(1 + exp(b * (c-x))) * a/(1 + exp(d * (e-x))), start=list(a=3, b = 1.3, c = 3.4, d=-0.08, e = -27), data = df_unique_carbon)
+
+# We define our sigmoid function to have an idea of the fitting with the data that have been used
+double_sigmoid = function(params_carbon, x) {
+  params_carbon[1] / (1 + exp(params_carbon[2] * ((params_carbon[3]) - x))) * params_carbon[1] / (1 + exp(params_carbon[4] * ((params_carbon[5]) - x)))
+}
+
+
+# Find the maximum value of the double sigmoidal function
+max_value_carbon <- max(double_sigmoid(coef(fitmodel_carbon), df_unique_carbon))
+
+# visualization code
+# get the coefficients using the coef function
+params_carbon=coef(fitmodel_carbon)
+
+# We plot the bin data with the double sigmoidal curve and fitting parameters found previously
+ggplot(data = dataset_carbon, aes(x = carbon_bin, y = FAO_limit)) + geom_point() +
+  labs(y = "Suitability index (FAO)", x = "Soil carbon content") +
+  theme_minimal(base_family = "serif", base_size = 15) +
+  stat_function(fun=function(x){((params_carbon[1]/(1+exp(params_carbon[2]*(params_carbon[3]-x)))) * (params_carbon[1]/(1+exp(params_carbon[4]*(params_carbon[5]-x)))))/max_value_carbon})
+ # ggsave(filename = "./figures/fit_Csoil.png", bg = "white")
+```
+
+### pH 
+```{r}
+# For carbon, chosen points have 
+# 4 < carbon < 10
+# ai > 0.5
+# GDD > 1300
+grid_fitting_ph <- grid_fitting %>% filter(ai_30 > 0.5 & carbon > 4 & carbon < 10 & gdd_30 > 1300) %>% dplyr::select(gid, FAO_suit, pH)
+
+# We now construct bins of observations and take the max of each bins (1 bin for each observation with a carbon break of 0.1)
+# Ex: all obs with  0 < pH < 0.1 will belong to bin 1, etc...
+
+grid_fitting_ph <- grid_fitting_ph %>% mutate(points_bin = cut(pH, breaks= 50))
+
+# For each pH bins, we take the average carbon value and associate it to the max suitability value (i.e. given this pH range, what is the maximal yield we can get)
+grid_fitting_ph <- grid_fitting_ph %>% group_by(points_bin) %>% mutate(pH_bin = mean(pH), 
+                                                                         FAO_limit = max(FAO_suit)) %>% ungroup()
+
+#important to sort along x values so that the plotting looks like one single line
+# Lets first select and drop the geometry
+dataset_ph <- grid_fitting_ph %>% st_drop_geometry() %>% dplyr::select(pH_bin, FAO_limit)
+dataset_ph <- dataset_ph[order(dataset_ph$pH_bin),] # Ordering
+
+
+# We can see that we have 3 parts: 
+# First the linear increase from 0 to approx 6.5, then the plateau until 7.2 and finally a linear decrease.
+# Lets find the first plateau point and fit a linear relationship 
+# First plateau it reached at 6.280128.
+
+
+# Since we still have repeated bins and FAO_limit, we just take one per bins, hence using the unique function()
+df_unique_ph <- unique(dataset_ph)
+df_unique_ph <- data.frame(x=df_unique_ph$pH_bin, y=df_unique_ph$FAO_limit)
+
+# fitting code for the first plateau
+# Here we fit a linear model for pH to reach the first plateau
+fitmodel_ph <- lm(y ~ x, data = df_unique_ph %>% filter(x <= 6.280128))
+
+# We define our sigmoid function to have an idea of the fitting with the data that have been used
+linear_model <- function(params_ph, x) {
+params_ph[1] + params_ph[2]*x
+}
+
+# visualization code
+# get the coefficients using the coef function
+params_ph <- c(as.numeric(fitmodel_ph$coefficients[1]), as.numeric(fitmodel_ph$coefficients[2]))
+
+# Hence, pH value reach plateau for x greater or equal to 
+round((1-params_ph[1])/params_ph[2], digits = 2) #6.53, which correspond to estimates from ramankutty (6.5).
+
+# Second plateau, pH will take value 1 until it starts to decrease again after 7.194691
+
+# fitting code
+# Here we fit a linear model for pH to reach the first plateau
+fitmodel_ph_2 <- lm(y ~ x, data = df_unique_ph %>% filter(x > 7.206488))
+
+# We define our sigmoid function to have an idea of the fitting with the data that have been used
+linear_model_2 <- function(params_ph_2, x) {
+params_ph_2[1] + params_ph_2[2]*x
+}
+
+# visualization code
+# get the coefficients using the coef function
+params_ph_2 <- c(as.numeric(fitmodel_ph_2$coefficients[1]), as.numeric(fitmodel_ph_2$coefficients[2]))
+
+# Equal to 1 when x =
+
+round((1 - params_ph_2[1])/params_ph_2[2], digits = 2) # 7.09
+
+# Lets plot our 3 parts
+
+# We plot the bin data with the double sigmoidal curve and fitting parameters found previously
+ggplot(data = dataset_ph, aes(x = pH_bin, y = FAO_limit)) + geom_point() +
+  labs(y = "Suitability index (FAO)", x = "Soil potential hydrogen") +
+  theme_minimal(base_family = "serif", base_size = 15) +
+  stat_function(fun=function(x){params_ph[1] + params_ph[2]*x}, xlim = c(min(dataset_ph$pH_bin), 6.53)) +
+  stat_function(fun=function(x){1}, xlim = c(6.53, 7.09)) +
+  stat_function(fun=function(x){params_ph_2[1] + params_ph_2[2]*x}, xlim = c(7.09, max(dataset_ph$pH_bin)))
+# ggsave(filename = "./figures/fit_pHsoil.png", bg = "white")
+```
+
+
+
+
+
+## B) Applying the functional forms
+
+### f(AI)
+
+Aridity Index functional form
+
+In order to assess crop suitability, Ramankutty fit a sigmoidal used the probability density function (pdf) of fractional cropland area vs. alpha. 
+Since we decided to use a different dataset for soil moisture (aridity index) the parameters found using a sigmidal fitting curves are the following:
+
+$$f(AI) = \frac{1}{1 + e^{21.95(0.236 \;- \;AI)}}$$
+```{r}
+load("./processed_data/grid_AI.Rdata")
+# Computation of the f(AI)
+for (i in 1:501){
+  # We first rename the colnames so that it easier to apply the mutate in a loop 
+  colnames(grid_AI[[i]]) <- c("gid", "AI", "geometry")
+  
+  # We create the f_ai following our parameters
+  grid_AI[[i]] <- grid_AI[[i]] %>% mutate(f_ai = 1/(1+exp(as.numeric(params_ai[1])*(as.numeric(params_ai[2])-AI))))
+}
+
+# save(grid_AI, file = "./processed_data/grid_AI.Rdata", overwrite = T)
+```
+
+
+### f(C)
+Similarly to the moisture index, they fit a double sigmoidal function to the relationship between Carbon content and the cropland area:
+$$f(C_{\mathrm{soil}}) = \frac{a}{1 \; + \; e^{b(c\;-\;C_{\mathrm{soil}})}}\;\times\;\frac{a}{1\;+\;e^{d(e\;-\;C_{\mathrm{soil}})}}$$
+
+$$\mathrm{where}\quad a = 0.983\quad b = 1.695\quad c = 2.30\quad d = -0.667\quad e = 13.72$$
+
+Carbon content functional forms
+```{r}
+load("./processed_data/grid_HWSD.Rdata")
+# We compute the f(C), without forgetting to normalize the function dividing by max_carbon value
+grid_HWSD <- grid_HWSD %>% mutate(f_carbon = ((as.numeric(params_carbon[1])/(1 + exp(as.numeric(params_carbon[2])*(as.numeric(params_carbon[3]) - carbon))))*(as.numeric(params_carbon[1])/(1 + exp(as.numeric(params_carbon[4])*(as.numeric(params_carbon[5]) - carbon))))/max_value_carbon))
+
+grid_HWSD$f_carbon %>% summary()
+
+grid_HWSD <- grid_HWSD %>% mutate(f_carbon =  ifelse(f_carbon > 1, 1, f_carbon))
+```
+
+### f(pH)
+Functional forms of Soil Ph 
+
+Here the relationship between crop land area and the pH content is given as follow:
+
+$$f(pH_\mathrm{soil}) = -2.085\;+\;0.475pH_\mathrm{soil}\quad \mathrm{if}\quad pH_\mathrm{soil}\leq 6.5$$
+$$f(pH_\mathrm{soil}) = 1 \quad \mathrm{if} \quad 6.5 <pH_\mathrm{soil}<8$$
+$$f(pH_\mathrm{soil}) = 1\;-\;2pH_\mathrm{soil}\quad \mathrm{if}\quad pH_\mathrm{soil}\geq8$$
+
+
+```{r, echo=F}
+grid_HWSD$pH %>% summary()
+
+# We create a dummy variable to indicate to which class the pH belong to
+# Class 1 is the downward phases with high concentration of pH (alkaline conditions)
+# Class 2 is the upward phase with low value of pH but increasing get better (acidic conditions)
+# Class 3 are perfect conditions 
+grid_HWSD <- grid_HWSD %>% mutate(class_1 = ifelse(pH > 7.2, 1, 0), 
+                              class_2 = ifelse(pH < 6.3, 1, 0), 
+                              class_3 = ifelse(pH <= 7.2 & pH >= 6.3, 1, 0))
+
+# Apply the functional forms 
+grid_HWSD <- grid_HWSD %>% mutate(f_ph = ifelse(class_1 == 1, as.numeric(params_ph_2[1])+as.numeric(params_ph_2[2])*pH, 
+                                            ifelse(class_2 == 1, as.numeric(params_ph[1])+as.numeric(params_ph[2])*pH, 
+                                                   ifelse(class_3 == 1, 1, 0))))
+
+grid_HWSD$f_ph %>% summary()
+
+#We bottom and top code 
+grid_HWSD <- grid_HWSD %>% mutate(f_ph = ifelse(f_ph < 0, 0, 
+                                            ifelse(f_ph > 1, 1, f_ph)))
+
+grid_HWSD <- grid_HWSD %>% dplyr::select(-c(class_1, class_2, class_3))
+
+# save(grid_HWSD, file = "./processed_data/grid_HWSD.Rdata", overwrite = T)
+```
+
+### f(GDD)
+
+Then the functional form is given as follow:
+
+$$f(GDD) = \frac{1}{1\;+\;e^{0.0078(1019.5\;-\;GDD)}}$$
+Similarly to the alpha measure, I adjusted the parameters since the data used in order to fit the curve are not the same and yielded different results.
+
+```{r, echo=F}
+load("./processed_data/grid_GDD.Rdata")
+for (i in 1:501){
+  grid_GDD[[i]] <- grid_GDD[[i]] %>% mutate(f_gdd = 1/(1+exp(as.numeric(params_gdd[1])*(as.numeric(params_gdd[2])-gdd))))
+}
+
+# save(grid_GDD, file = "./processed_data/grid_GDD.Rdata", overwrite = T)
+```
+
+
+# Part 3: Creation of the index 
+
+Putting everything together we can now build the measure of crop suitability:
+
+$$S_{\mathrm{crop}} = f(AI)\;\times \; f(C_{\mathrm{soil}})\;\times\;f(pH_{\mathrm{soil}})\;\times\;f(GDD)$$
+```{r, echo=F}
+load("./processed_data/grid_GDD.Rdata")
+load("./processed_data/grid_AI.Rdata")
+load("./processed_data/grid_HWSD.Rdata")
+
+grid_suit <- rep(list(grid_europe), 501)
+for (i in 1:501){
+grid_suit[[i]]$f_gdd <- grid_GDD[[i]]$f_gdd
+grid_suit[[i]]$f_ai <- grid_AI[[i]]$f_ai
+grid_suit[[i]]$f_c <- grid_HWSD$f_carbon
+grid_suit[[i]]$f_ph <- grid_HWSD$f_ph
+grid_suit[[i]] <- grid_suit[[i]] %>% mutate(suit = f_gdd*f_ai*f_c*f_ph)  
+}
+
+#save(grid_suit, file = "./processed_data/grid_suit.Rdata", overwrite = T)
+
+```
+
+
+Creation of the raster
+```{r}
+# We creat the extent raster with the extent of the project, resolution and CRS (EPSG:4326)
+my_rast <- raster(extent(EXTproject), res = 0.5, crs = CRSproject)
+
+# We create a list where we store the different raster
+# We use the fasterize function which is way faster and produce similar results than the terra packages. Since resolution, crs and extent are the same, both extracting at mean or last level produces the same results (I verified). The only difference is that terra produce a RasterStack while fasterize a RasterLayer.
+raster_suit <- rep(list(0), 501)
+
+
+for (i in 1:501){
+  raster_suit[[i]] <- fasterize::fasterize(grid_suit[[i]], my_rast, field = "suit", fun = "last")
+}
+
+# Stack all the layers together
+raster_suit_brick <- raster::brick(raster_suit)
+
+# Change names of raster layer
+names_suit <- paste("suit", sep = "_", as.character(seq(1500, 2000, by = 1)))
+
+names(raster_suit_brick) <- names_suit
+
+# Change name of the dataset before saving
+suit <- raster_suit_brick
+
+# writeRaster(suit, filename = "./processed_data/suit.tif", bandorder = "BIL", overwrite = TRUE)   
+```
+
+
+# Part 4: Other existing datasets
+## Ramankutty/Kaplan data
+In this chunk we import and process the crop suitability from Ramankutty et al.
+```{r}
+raman <- raster("./inputs/Ramankutty/croppasturesuit.nc", var = "crops")
+raman_gdd <- raster("./inputs/Ramankutty/croppasturesuit.nc", var = "gdd5")
+raman_csoil <- raster("./inputs/Ramankutty/croppasturesuit.nc", var = "soil_carbon")
+raman_ph <- raster("./inputs/Ramankutty/croppasturesuit.nc", var = "soil_ph")
+raman_alpha <- raster("./inputs/Ramankutty/croppasturesuit.nc", var = "annual_alpha") # range from 0 to 1--> f(alpha)
+
+# We crop to the extend of our study
+raman_eur <- crop(raman, grid_europe)
+raman_gdd_eur <- crop(raman_gdd, grid_europe)
+raman_csoil_eur <- crop(raman_csoil, grid_europe)
+raman_ph_eur <- crop(raman_ph, grid_europe)
+raman_alpha_eur <- crop(raman_alpha, grid_europe)
+
+# We extract the mean value at our grid
+raman_grid <- grid_europe %>% dplyr::select(-layer)
+
+raman_grid$raman_suit <- exact_extract(raman_eur, raman_grid, fun = "mean")
+raman_grid$raman_gdd <- exact_extract(raman_gdd_eur, raman_grid, fun = "mean")
+raman_grid$raman_falpha <- exact_extract(raman_alpha_eur, raman_grid, fun = "mean")
+raman_grid$raman_csoil <- exact_extract(raman_csoil_eur, raman_grid, fun = "mean")
+raman_grid$raman_ph <- exact_extract(raman_ph_eur, raman_grid, fun = "mean")
+
+
+
+### DO WE REALLY NEED TO COMPUTE THE FUNCTIONAL FORMS FROM RAMAKUTTY??
+
+# We can compute the parameters applied to their functional forms
+raman_grid <- raman_grid %>% mutate(raman_fgdd = 1/(1+exp(0.004*(1200-raman_gdd))), 
+                                    raman_fcsoil = (3.9157/(1 + exp(1.3766*(3.468 - raman_csoil))))*(3.9157/(1 + exp(-0.0791*(-27.33 - raman_csoil)))))
+
+# The soil pH is a bit more involved
+# We create a dummy variable to indicate to which class the pH belong to
+raman_grid <- raman_grid %>% mutate(class_1 = ifelse(raman_ph > 8 & raman_ph <= 8.5, 1, 0), 
+                              class_2 = ifelse(raman_ph < 6.5, 1, 0), 
+                              class_3 = ifelse(raman_ph <= 8 & raman_ph >= 6.5, 1, 0), 
+                              class_4 = ifelse(raman_ph > 8.5, 1, 0))
+
+# Apply the functional forms 
+
+raman_grid <- raman_grid %>% mutate(raman_fph = ifelse(class_1 == 1, 1-2*(raman_ph-8), 
+                                            ifelse(class_2 == 1, -2.085+0.475*raman_ph, 
+                                                   ifelse(class_3 == 1, 1, 0))))
+#We bottom and top code 
+raman_grid <- raman_grid %>% mutate(raman_fph = ifelse(raman_fph < 0, 0, 
+                                            ifelse(raman_fph > 1, 1, raman_fph)))
+# We drop the class 
+raman_grid <- raman_grid %>% dplyr::select(-c(class_1, class_2, class_3, class_4))
+
+# Save the grid
+#save(raman_grid, file = "./processed_data/grid_raman.Rdata", overwrite = T)
+
+```
+
+
+## Refernce evapotarnspiration
+IN the next chunks, we will compare our measure of reference evapotranspiration to the one computed in rencently released datasets 
+We will start by the one in the Version 3 of the Global Aridity Index and Potential Evapotranspiration Database by Zomer et al. (2022).
+The dataset provide a measure of ET0 using climate data averaged over the 1970 - 2000 period (annual average).
+
+```{r}
+# Load the technical validation grid
+#load("./processed_data/tech_val.Rdata")
+
+# Load the dataset from zomer et al. 2022
+ET0_zomer <- raster("./inputs/reference_evapo/Global-AI_ET0_v3_annual/et0_v3_yr.tif")
+
+# We crop it to the extend of the study and extract at grid level
+ET0_zomer_eur <- crop(ET0_zomer, grid_europe)
+
+tech_val$ET0_zomer <- exact_extract(ET0_zomer_eur, grid_scrop[[1]], fun = "mean")
+
+# The reference is in mm per year, we can convert it daily
+tech_val <- tech_val %>% mutate(ET0_zomer = ET0_zomer/365)
+
+# We load our reference evapotranspiration measure 
+load("./processed_data/grid_evapo.Rdata")
+
+
+
+# HERE CHANGE CODE AS WELL, PART OF THE DROPPING SMALL GRIDS
+for (i in 1:501){
+  Reference_Evapo_grid[[i]] <- left_join(Reference_Evapo_grid[[i]], small_areas %>% st_drop_geometry() %>% dplyr::select(gid, small), by = "gid")
+  Reference_Evapo_grid[[i]] <- Reference_Evapo_grid[[i]] %>% filter(is.na(small))
+  Reference_Evapo_grid[[i]] <- Reference_Evapo_grid[[i]] %>% dplyr::select(-small)
+}
+# STOP PART FOR THE CHANGE
+
+
+
+
+
+# We select tge year from 1970 - 2000
+evapo_30 <- Reference_Evapo_grid[c(472:501)]
+
+evapo_30_avg <- evapo_30[[1]]
+# We repeatedely left join 
+
+for (i in 2:30){
+  evapo_30_avg <- left_join(evapo_30_avg, evapo_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, ET0), by = "gid")
+}
+
+# Column 6 to 35 are scrop over the 30 years period: 1961 to 1990
+# We take only scrops and apply a rowmeans 
+rows_evapo <- evapo_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-c(gid))
+rows_evapo$evapo_30 <- rowMeans(rows_evapo, na.rm = T)
+
+tech_val$evapo_30 <- rows_evapo$evapo_30
+
+# Save the technical validation grid
+
+#save(tech_val, file = "./processed_data/tech_val.Rdata", overwrite = T)
+```
+
+
+PUT THIS LAST PART IN THE TECHNICAL VALIDATION
+
+# Part 4: Technical validation
+## Ramakutty et al. 2002
+This chunk will compute the grid averaging over the period 1961-1990 to compare with ramakutty
+```{r}
+# We load the gridded dataset of agricultural suitability
+load("./processed_data/grid_scrop.Rdata")
+load("./processed_data/grid_GDD.Rdata")
+load("./processed_data/grid_ai_index.Rdata")
+load("./processed_data/grid_carbon.Rdata")
+load("./processed_data/grid_ph.Rdata")
+
+# Load the ramankutty index at grid 
+load("./processed_data/grid_raman.Rdata")
+
+
+# We need to remove the small cells that we have droped 
+
+
+# CODE TO CHANGE IN THE FUTURE AND DEFINE SMALL AREA AN THE TOP
+for (i in 1:501){
+  GDD_grid[[i]] <- left_join(GDD_grid[[i]], small_areas %>% st_drop_geometry() %>% dplyr::select(gid, small), by = "gid")
+  GDD_grid[[i]] <- GDD_grid[[i]] %>% filter(is.na(small))
+  GDD_grid[[i]] <- GDD_grid[[i]] %>% dplyr::select(-small)
+
+  AI_index_grid[[i]] <- left_join(AI_index_grid[[i]], small_areas %>% st_drop_geometry() %>% dplyr::select(gid, small), by = "gid")
+  AI_index_grid[[i]] <- AI_index_grid[[i]] %>% filter(is.na(small))
+  AI_index_grid[[i]] <- AI_index_grid[[i]] %>% dplyr::select(-small)
+}
+
+grid_carbon <- left_join(grid_carbon, small_areas %>% st_drop_geometry() %>% dplyr::select(gid, small), by = "gid")
+grid_carbon <- grid_carbon %>% filter(is.na(small))
+grid_carbon <- grid_carbon %>% dplyr::select(-small)
+
+grid_pH <- left_join(grid_pH, small_areas %>% st_drop_geometry() %>% dplyr::select(gid, small), by = "gid")
+grid_pH <- grid_pH %>% filter(is.na(small))
+grid_pH <- grid_pH %>% dplyr::select(-small)
+
+raman_grid <- left_join(raman_grid, small_areas %>% st_drop_geometry() %>% dplyr::select(gid, small), by = "gid")
+raman_grid <- raman_grid %>% filter(is.na(small))
+raman_grid <- raman_grid %>% dplyr::select(-small)
+## CODE TO CHANGE STOPS HERE
+
+
+
+grid_scrop_30 <- grid_scrop[c(462:491)]
+GDD_grid_30 <- GDD_grid[c(462:491)]
+AI_index_grid_30 <- AI_index_grid[c(462:491)]
+
+
+grid_scrop_30_avg <- grid_scrop_30[[1]]
+# We repeatedely left join 
+
+for (i in 2:30){
+  grid_scrop_30_avg <- left_join(grid_scrop_30_avg, grid_scrop_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, s_crop), by = "gid")
+}
+
+# Column 6 to 35 are scrop over the 30 years period: 1961 to 1990
+# We take only scrops and apply a rowmeans 
+
+rows_crop <- grid_scrop_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-c(gid, f_gdd, f_ai, f_c, f_ph))
+rows_crop$s_crop_30 <- rowMeans(rows_crop, na.rm = T)
+
+
+# Same for GDD and f(GDD)
+grid_gdd_30_avg <- GDD_grid_30[[1]] %>% dplyr::select(gid, gdd)
+for (i in 2:30){
+  grid_gdd_30_avg <- left_join(grid_gdd_30_avg, GDD_grid_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, gdd), by = "gid")
+}
+
+rows_gdd <- grid_gdd_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+rows_gdd$gdd_30 <- rowMeans(rows_gdd, na.rm = T)
+# fgdd
+grid_fgdd_30_avg <- GDD_grid_30[[1]] %>% dplyr::select(gid, f_gdd)
+for (i in 2:30){
+  grid_fgdd_30_avg <- left_join(grid_fgdd_30_avg, GDD_grid_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, f_gdd), by = "gid")
+}
+
+rows_fgdd <- grid_fgdd_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+rows_fgdd$fgdd_30 <- rowMeans(rows_fgdd, na.rm = T)
+
+# F_ai
+grid_fai_30_avg <- AI_index_grid_30[[1]] %>% dplyr::select(gid, f_ai)
+for (i in 2:30){
+  grid_fai_30_avg <- left_join(grid_fai_30_avg, AI_index_grid_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, f_ai), by = "gid")
+}
+
+rows_fai <- grid_fai_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+rows_fai$fai_30 <- rowMeans(rows_fai, na.rm = T)
+
+
+
+# We attach the soil ph and carbon content
+raman_grid <- left_join(raman_grid, grid_pH %>% st_drop_geometry() %>% dplyr::select(gid, f_ph), by = "gid")
+raman_grid <- left_join(raman_grid, grid_carbon %>% st_drop_geometry() %>% dplyr::select(gid, f_carbon), by = "gid")
+
+
+# We bring the average back to the raman grid
+raman_grid$suit_30 <- rows_crop$s_crop_30
+raman_grid$gdd_30 <- rows_gdd$gdd_30
+raman_grid$fgdd_30 <- rows_fgdd$fgdd_30
+raman_grid$fai_30 <- rows_fai$fai_30
+
+tech_val <- raman_grid
+
+# We save the grid for technical validation exploration
+# save(tech_val, file = "./processed_data/tech_val.Rdata", overwrite = T)
+```
+
+
+## Averages to compare to FAO (1971 - 2000)
+IMPROVE A BIT THIS PASSAGE
+```{r}
+# Load the ramankutty index at grid 
+load("./processed_data/grid_raman.Rdata")
+raman_grid <- left_join(raman_grid, small_areas %>% st_drop_geometry() %>% dplyr::select(gid, small), by = "gid")
+raman_grid <- raman_grid %>% filter(is.na(small))
+raman_grid <- raman_grid %>% dplyr::select(-small)
+
+
+grid_scrop_30 <- grid_scrop[c(472:501)]
+GDD_grid_30 <- GDD_grid[c(472:501)]
+AI_index_grid_30 <- AI_index_grid[c(472:501)]
+
+
+grid_scrop_30_avg <- grid_scrop_30[[1]]
+# We repeatedely left join 
+
+for (i in 2:30){
+  grid_scrop_30_avg <- left_join(grid_scrop_30_avg, grid_scrop_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, s_crop), by = "gid")
+}
+
+# Column 6 to 35 are scrop over the 30 years period: 1961 to 1990
+# We take only scrops and apply a rowmeans 
+
+rows_crop <- grid_scrop_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-c(gid, f_gdd, f_ai, f_c, f_ph))
+rows_crop$s_crop_30 <- rowMeans(rows_crop, na.rm = T)
+
+
+# Same for GDD and f(GDD)
+grid_gdd_30_avg <- GDD_grid_30[[1]] %>% dplyr::select(gid, gdd)
+for (i in 2:30){
+  grid_gdd_30_avg <- left_join(grid_gdd_30_avg, GDD_grid_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, gdd), by = "gid")
+}
+
+rows_gdd <- grid_gdd_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+rows_gdd$gdd_30 <- rowMeans(rows_gdd, na.rm = T)
+# fgdd
+grid_fgdd_30_avg <- GDD_grid_30[[1]] %>% dplyr::select(gid, f_gdd)
+for (i in 2:30){
+  grid_fgdd_30_avg <- left_join(grid_fgdd_30_avg, GDD_grid_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, f_gdd), by = "gid")
+}
+
+rows_fgdd <- grid_fgdd_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+rows_fgdd$fgdd_30 <- rowMeans(rows_fgdd, na.rm = T)
+
+# F_ai
+grid_fai_30_avg <- AI_index_grid_30[[1]] %>% dplyr::select(gid, f_ai)
+for (i in 2:30){
+  grid_fai_30_avg <- left_join(grid_fai_30_avg, AI_index_grid_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, f_ai), by = "gid")
+}
+
+rows_fai <- grid_fai_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-gid)
+rows_fai$fai_30 <- rowMeans(rows_fai, na.rm = T)
+
+
+
+# We attach the soil ph and carbon content
+raman_grid <- left_join(raman_grid, grid_pH %>% st_drop_geometry() %>% dplyr::select(gid, f_ph), by = "gid")
+raman_grid <- left_join(raman_grid, grid_carbon %>% st_drop_geometry() %>% dplyr::select(gid, f_carbon), by = "gid")
+
+
+# We bring the average back to the raman grid
+raman_grid$suit_30 <- rows_crop$s_crop_30
+raman_grid$gdd_30 <- rows_gdd$gdd_30
+raman_grid$fgdd_30 <- rows_fgdd$fgdd_30
+raman_grid$fai_30 <- rows_fai$fai_30
+
+tech_val$suit_30_recent <- raman_grid$suit_30
+tech_val$gdd_30_recent <- raman_grid$gdd_30
+tech_val$fgdd_30_recent <- raman_grid$fgdd_30
+tech_val$fai_30_recent <- raman_grid$fai_30
+
+# We save the grid for technical validation exploration
+# save(tech_val, file = "./processed_data/tech_val.Rdata", overwrite = T)
+```
