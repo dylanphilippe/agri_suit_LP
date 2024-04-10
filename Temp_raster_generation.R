@@ -1,26 +1,18 @@
 
   
-wd <- "C:/Users/DylanPhilippe/OneDrive - Wyss Academy for Nature/Documents/GitHub/Agricultural_Suitability"
+wd <- "SET WORKING DIRECTORY HERE"
 setwd(wd)
 extent_temp <- c(-25, 40, 35, 70)
 
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(raster, tmap, dplyr)
-  
-# Let's first import the historical temperature dataset from Luterbacher. Here are some info on the README textfile:
-# Grid: 0.5? x 0.5?  
-# Spatial area: 25W - 40E und 30 - 70N
-# Note: the date are valied for a 0.5x0.5deg box. The center of the box is always on a xx.25 coordinate	
-# Time period: Winter 1500 - Autumn 2002 
-# YearSeason followed by 9100 Gridpoints
-# Seasons are given as  13(Winter, DJF), 14(Spring, MAM), 15 (Summer, JJA), 16 (Autumn, SON)
+
 
 historical_temp <- as.matrix(read.table("./inputs/Temperature/TT_Europe_1500_2002.txt", sep = ""))
 # The table is huge. We can see that the first column give the year and the season.
 # Hence, the first line given by 150013 is the average temperature for winter 1500.
 # We can henceforth create a loop over the lines to extract all the year and season and generate rasters out of it.
 
-# dim(historical_temp)
 
 # We have 2012 lines and 9101 columns
 # We can first drop the first column as we know when it starts and when it ends

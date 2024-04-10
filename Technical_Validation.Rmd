@@ -1,0 +1,168 @@
+---
+title: "Tech_val"
+author: "Dylan Philippe & Alexander Lehner"
+date: "10/04/2024"
+output: html_document
+---
+
+
+
+Clear workplace and memory
+```{r}
+rm(list = ls())
+gc()
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "SET WORKING DIRECTORY HERE") # Set the knit root.dir here
+```
+
+
+
+```{r, echo=F}
+# We import the necessary packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(raster, tmap, dplyr, sf, R.utils, ggplot2, rgeos, 
+               nngeo, exactextractr, gifski, rlist, ncdf4, tidyr, zoo, 
+               fasterize, minpack.lm)
+
+options(scipen = 999) # This option allows to remove the scientific notation
+
+# Deactivate the spherical geometry S2
+sf::sf_use_s2(FALSE)
+
+CRSproject <- "EPSG:4326"
+EXTproject <- c(-25, 40, 35, 70) 
+```
+
+
+Load data 
+```{r}
+load("./processed_data/grid_europe.Rdata")
+```
+
+
+# Reference evapo
+In the next chunks, we will compare our measure of reference evapotranspiration to the one computed in recently released datasets 
+We will start by the one in the Version 3 of the Global Aridity Index and Potential Evapotranspiration Database by Zomer et al. (2022).
+The dataset provide a measure of ET0 using climate data averaged over the 1970 - 2000 period (annual average).
+
+```{r}
+tech_val <- grid_europe
+# Load the dataset from zomer et al. 2022
+ET0_zomer <- raster("./inputs/reference_evapo/Global-AI_ET0_v3_annual/et0_v3_yr.tif")
+
+# We crop it to the extend of the study and extract at grid level
+ET0_zomer_eur <- crop(ET0_zomer, grid_europe)
+
+tm_shape(ET0_zomer_eur) + tm_raster()
+
+tech_val$ET0_zomer <- exact_extract(ET0_zomer_eur, tech_val, fun = "mean")
+
+# The reference is in mm per year, we can convert it daily
+tech_val <- tech_val %>% mutate(ET0_zomer = ET0_zomer/365)
+
+# We load our reference evapotranspiration measure 
+load("./processed_data/grid_evapo.Rdata")
+
+# We select the year from 1970 - 2000
+evapo_30 <- Reference_Evapo_grid[c(472:501)]
+
+evapo_30_avg <- evapo_30[[1]]
+# We repeatedely left join 
+
+for (i in 2:30){
+  evapo_30_avg <- left_join(evapo_30_avg, evapo_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, ET0), by = "gid")
+}
+
+
+# We remove the gid and geometry variable and apply the rowmean
+rows_evapo <- evapo_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-c(gid))
+rows_evapo$evapo_30 <- rowMeans(rows_evapo, na.rm = T)
+
+tech_val$evapo_30 <- rows_evapo$evapo_30
+```
+
+
+# Ramakutty et al. 2002
+
+## Ramankutty data
+In this chunk we import and process the crop suitability from Ramankutty et al.
+```{r}
+raman <- raster("./inputs/Ramankutty/croppasturesuit.nc", var = "crops")
+
+
+# We crop to the extend of our study
+raman_eur <- crop(raman, grid_europe)
+
+tech_val$raman_suit <- exact_extract(raman_eur, tech_val, fun = "mean")
+```
+
+
+This chunk will compute the grid averaging over the period 1961-1990 to compare with ramakutty
+```{r}
+# We load the gridded dataset of agricultural suitability
+load("./processed_data/grid_suit.Rdata")
+
+# We need to remove the small cells that we have droped 
+
+grid_suit_30 <- grid_suit[c(462:491)]
+
+
+grid_suit_30_avg <- grid_suit_30[[1]]
+# We repeatedely left join 
+
+for (i in 2:30){
+  grid_suit_30_avg <- left_join(grid_suit_30_avg, grid_suit_30[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, suit), by = "gid")
+}
+
+
+rows_suit <- grid_suit_30_avg %>% st_drop_geometry() %>%
+  dplyr::select(-c(gid, f_c, f_ai, f_gdd, f_ph))
+rows_suit$suit_30 <- rowMeans(rows_suit, na.rm = T)
+
+
+# We bring the average back
+tech_val$suit_30_raman <- rows_suit$suit_30
+```
+
+
+# FAO
+```{r}
+# We average our suitability to match the one of FAO 
+load("./processed_data/grid_FAO.Rdata")
+
+grid_suit_FAO <- grid_suit[c(472:501)]
+
+
+grid_suit_FAO_avg <- grid_suit_FAO[[1]]
+# We repeatedly left join 
+
+for (i in 2:30){
+  grid_suit_FAO_avg <- left_join(grid_suit_FAO_avg, grid_suit_FAO[[i]] %>%
+                                   st_drop_geometry() %>% dplyr::select(gid, suit), by = "gid")
+}
+
+# Column 6 to 35 are scrop over the 30 years period: 1971 - 2000
+rows_suit <- grid_suit_FAO_avg %>% st_drop_geometry() %>%
+  dplyr::select(-c(gid, f_gdd, f_ai, f_c, f_ph))
+rows_suit$suit_30_FAO <- rowMeans(rows_suit, na.rm = T)
+
+
+
+tech_val$suit_30_FAO <- rows_suit$suit_30_FAO
+
+# Now the FAO
+tech_val <- left_join(tech_val, grid_FAO %>% st_drop_geometry() %>% dplyr::select(gid, FAO_suit), by = "gid")
+```
+
+
+```{r}
+# Save the dataset 
+save(tech_val, file = "./processed_data/tech_val.Rdata", overwrite = T)
+```

@@ -1,15 +1,4 @@
-# Gridded (0.5? resolution, lon x lat = 140 x 82) 
-# precipitation reconstructions over all European land areas for winter (prec_pauling_wi.txt), spring (prec_pauling_sp.txt), 
-# summer (prec_pauling_su.txt) and autumn (prec_pauling_au.txt). 
-
-# All these files cover the area 30.25N-70.75N / 29.75W-39.75E (all coordinates given here denote the centre of each box).
-# Non-land grid boxes are indicated by values set to -99.999.
-# Data run from 1500 to 2000. Data from 1901-2000 are observational estimates from the Mitchell et al. (2004) dataset. 
-# Data prior to 1901 are reconstructed values (see data set reference for details: Pauling et al. (2005)). 
-
-# https://crudata.uea.ac.uk/cru/projects/soap/data/recon/#paul05
-
-# We first creat a list of 501 entries, one for each year ranging from 1500 to 2000.
+# We first create a list of 501 entries, one for each year ranging from 1500 to 2000.
 # We will start by importing then precipitation for autumn and continue with the other seasons.
 extent_pre <- c(-29.75, 39.75, 30.25, 70.75)
 

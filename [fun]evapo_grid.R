@@ -52,7 +52,6 @@ Reference_Evapo <- function(TEMPER, TMAX, TMIN, WIND, HUM, SUN, LATITUDE, ELEVAT
     seq_year <- seq(1, 365, by = 1)
     #delta <- rep(list(0), 365)
     # Declination can also be given in radians by the Spencer formula (Spenser, 1971)
-    # https://www.sciencedirect.com/topics/engineering/solar-declination
     
     Tau[[i]] <- ((2*pi*seq_year[i])-1)/365
     
@@ -63,7 +62,6 @@ Reference_Evapo <- function(TEMPER, TMAX, TMIN, WIND, HUM, SUN, LATITUDE, ELEVAT
     d[[i]] <- (1 + 0.033*cos(((2*pi)/365)*seq_year[i]))
     
     # Sunset hour angle (rad)
-    # ARCCOS defined only between -1 and +1, put max and min threshold!!
     psi[[i]] <- acos(-(tan(Phi))*tan(delta[[i]]))
     
     # Extraterrestrial radiation
@@ -88,18 +86,12 @@ Reference_Evapo <- function(TEMPER, TMAX, TMIN, WIND, HUM, SUN, LATITUDE, ELEVAT
     # Net radiation flux at surface
     Rn[[i]] <- Rns[[i]] - Rnl[[i]]
     
-    # Soil heat flux
-    
-    # G <- 0.14*(as.matrix(TEMPER)-as.matrix(TEMPERpre))
-    
     # The aerodynamic term
     ETar <- gamma/(C+gamma_star)*(900/(TEMPER+273))*WIND*(e_a-e_d)
     
     
     # The radiation term 
-    
-    # ETra <- C/(C + gamma_star)*(Rn-G)*(1/Lambda1)
-    # ETra without the "G" using previous temperature
+  
     ETra[[i]] <- C/(C + gamma_star)*(Rn[[i]])*(1/Lambda1)
     
     ET0[[i]] <- ETar + ETra[[i]]

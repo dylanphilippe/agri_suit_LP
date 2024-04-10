@@ -1,5 +1,4 @@
 
-
 CRU_manipulation <- function(sun, hum, wind, elev){
 
 ## we start with sunshine
